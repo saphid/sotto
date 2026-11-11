@@ -73,9 +73,9 @@ final class InlayController: ObservableObject {
         }
     }
     @Published private(set) var loginItemError: String?
-    @Published var muteOutputWhileRecording = false {
+    @Published var recordingOutputAudio = RecordingOutputAudio.none {
         didSet {
-            if !applyingConfiguration { configuration.update { $0.muteOutputWhileRecording = muteOutputWhileRecording } }
+            if !applyingConfiguration { configuration.update { $0.recordingOutputAudio = recordingOutputAudio.rawValue } }
         }
     }
     @Published var dictationSoundsEnabled = true {
@@ -175,6 +175,7 @@ final class InlayController: ObservableObject {
     private var applyingConfiguration = false
     private var recordingTimer: Timer?
     private var recordingStart: TimeInterval = 0
+    private var outputAudioPending = false
     private var microphoneStartTask: Task<Void, Never>?
     private var recorderStopTask: Task<CapturedAudio, Error>?
     private var deliveryTail: Task<Void, Never>?
@@ -354,7 +355,9 @@ final class InlayController: ObservableObject {
         if let key = HoldKey(rawValue: settings.holdKey), shortcut != key { shortcut = key }
         if let mode = HotkeyActivationMode(rawValue: settings.activationMode), activationMode != mode { activationMode = mode }
         if launchAtLogin != settings.launchAtLogin { launchAtLogin = settings.launchAtLogin }
-        if muteOutputWhileRecording != settings.muteOutputWhileRecording { muteOutputWhileRecording = settings.muteOutputWhileRecording }
+        if let mode = RecordingOutputAudio(rawValue: settings.recordingOutputAudio), recordingOutputAudio != mode {
+            recordingOutputAudio = mode
+        }
         if dictationSoundsEnabled != settings.dictationSoundsEnabled { dictationSoundsEnabled = settings.dictationSoundsEnabled }
         if customTriggerKeyCode != settings.customTriggerKeyCode { customTriggerKeyCode = settings.customTriggerKeyCode }
         if preserveClipboard != settings.preserveClipboard { preserveClipboard = settings.preserveClipboard }
@@ -787,6 +790,7 @@ final class InlayController: ObservableObject {
         destinationTask?.cancel(); destinationTask = nil
         screenContextTask?.cancel(); screenContextTask = nil
         stopRecordingTimer()
+        outputAudioPending = false
         recorder.cancel()
         outputMuter.restore()
         recorder.onChunk = nil
@@ -1007,6 +1011,7 @@ final class InlayController: ObservableObject {
         monitorTask?.cancel(); refreshTask?.cancel(); hudTask?.cancel(); permissionTask?.cancel()
         configuration.stopWatching()
         subscriptions.removeAll()
+        outputMuter.stop()
         audioDevices.stop(); hotkey.stop(); continuationAnchors.removeAll()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         for observer in workspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
@@ -1016,7 +1021,20 @@ final class InlayController: ObservableObject {
 
     private func bindServices() {
         audioDevices.onChange = { [weak self] devices, defaultUID in self?.microphones.update(devices: devices, systemDefaultUID: defaultUID) }
-        recorder.onLevel = { [weak self] level in guard let self, isCapturing else { return }; recordingFeedback.append(level) }
+        recorder.onLevel = { [weak self] level in
+            guard let self, isCapturing else { return }
+            recordingFeedback.append(level)
+            // Apply once audio flows: a Bluetooth headset has switched to its call
+            // profile by then, and that profile has its own volume and mute.
+            if outputAudioPending {
+                outputAudioPending = false
+                switch recordingOutputAudio {
+                case .none: break
+                case .mute: outputMuter.mute()
+                case .duck: outputMuter.duck()
+                }
+            }
+        }
         recorder.onInterruption = { [weak self] message in self?.salvageDictation(reason: message) }
         hotkey.onStatusChange = { [weak self] in self?.isHotkeyActive = $0 }
         hotkey.onPress = { [weak self] in
@@ -1046,6 +1064,7 @@ final class InlayController: ObservableObject {
     @discardableResult
     private func beginDictation(isTest: Bool) -> Bool {
         guard !isCapturing, !isShuttingDown, !isRecordingKey else { return false }
+        outputMuter.restore()
         permissions = PermissionSnapshot.capture()
         stopShortcutCheck()
         guard isServerReady else { showError(serverStatusMessage); refreshServer(); return false }
@@ -1071,7 +1090,6 @@ final class InlayController: ObservableObject {
         activity = .starting
         statusMessage = "Connecting recording…"
         onHUDVisibility?(true)
-        if muteOutputWhileRecording { outputMuter.mute() }
         // Screen terms only become Qwen hints, so skip capture when the last-known
         // shared settings have proofreading off. The capture applies its own guards.
         if !isTest, useScreenContext, permissions.screenRecording,
@@ -1146,6 +1164,7 @@ final class InlayController: ObservableObject {
                 statusMessage = "Starting microphone…"
                 try await recorder.start(deviceID: deviceID, preserveOriginalAudio: created.settings.preferences.keepOriginalAudio)
                 guard sessionID == current, activity == .starting, !Task.isCancelled else { return }
+                outputAudioPending = true
                 activity = .recording
                 statusMessage = "Listening"
                 announceOutcome("Listening", .start)
@@ -1178,6 +1197,7 @@ final class InlayController: ObservableObject {
         // A take ended by the duration limit must not leave a double-tap
         // latch behind, matching the failure and cancel paths.
         hotkey.clearLatchedTake()
+        outputAudioPending = false
         recorder.stopAcceptingAudio()
         outputMuter.restore()
         guard activity == .recording else { discardCapture(); return }
